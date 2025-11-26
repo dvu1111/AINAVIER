@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Interactive Navier-Stokes Fluid Simulation</title>
+    <title>High-Performance Navier-Stokes Fluid Simulation</title>
     <style>
         /* Reset and Layout */
         body, html {
@@ -22,7 +22,12 @@
             display: block;
             width: 100%;
             height: 100%;
-            touch-action: none; /* Prevent scrolling on mobile */
+            /* Rendering: pixelated gives a crisp retro look (good for grids),
+               but auto/smooth is often better for fluids. 
+               We use standard scaling here for a smooth liquid look.
+            */
+            image-rendering: auto; 
+            touch-action: none;
         }
 
         /* UI Overlay */
@@ -39,9 +44,9 @@
             pointer-events: auto;
             user-select: none;
             transition: opacity 0.3s;
+            z-index: 10;
         }
 
-        /* Hide UI on small screens initially or add toggle (simplified here to always show but small) */
         @media (max-width: 600px) {
             #ui-container {
                 width: 180px;
@@ -131,6 +136,7 @@
             color: rgba(255,255,255,0.3);
             pointer-events: none;
             font-size: 14px;
+            z-index: 5;
         }
     </style>
 </head>
@@ -155,11 +161,12 @@
         </div>
 
         <div class="control-group">
-            <label>Resolution (Requires Reset)</label>
+            <label>Resolution</label>
             <select id="resolution" style="width: 100%; background: #222; color: white; border: 1px solid #444; padding: 4px;">
                 <option value="64">Low (64x64)</option>
                 <option value="128" selected>Medium (128x128)</option>
-                <option value="200">High (200x200)</option>
+                <option value="256">High (256x256)</option>
+                <option value="300">Ultra (300x300)</option>
             </select>
         </div>
 
@@ -173,38 +180,41 @@
     <canvas id="simCanvas"></canvas>
 
     <script>
-        // Wrap everything in an IIFE to avoid global variable collisions (fix for "redeclaration of global property v")
         (function() {
             /**
-             * FLUID SIMULATION CORE
-             * Based on Jos Stam's "Real-Time Fluid Dynamics for Games"
+             * OPTIMIZED FLUID SIMULATION
+             * - Uses direct pixel manipulation (ImageData)
+             * - Inlines math in hot loops
+             * - Uses CSS for scaling rather than drawing rectangles
              */
 
             // Configuration
             let N = 128;
-            let iter = 10; // Solver iterations (higher = more accurate incompressible fluid, slower)
-            let SCALE = 4; // Visual scaling factor
-
+            let iter = 10;
+            
             // Physics Globals
             let size = (N + 2) * (N + 2);
-            let dt = 0.1; // Time step
-            let diff = 0.0000; // Diffusion
-            let visc = 0.0000; // Viscosity
+            let dt = 0.1;
+            let diff = 0.0000;
+            let visc = 0.0000;
             
             // Arrays (Float32 for performance)
-            let u, v, u_prev, v_prev; // Velocity (x, y) and previous states
-            let dens, dens_prev; // Density (dye) and previous state
+            let u, v, u_prev, v_prev;
+            let dens, dens_prev;
 
             // Canvas & Context
             const canvas = document.getElementById('simCanvas');
-            const ctx = canvas.getContext('2d', { alpha: false }); // Alpha false for speed
-            let width, height;
+            // 'willReadFrequently' optimization for some browsers when using getImageData/putImageData
+            const ctx = canvas.getContext('2d', { alpha: false, willReadFrequently: true }); 
+            let imageData;
+            let data; // Reference to imageData.data
 
             // UI State
             let isMouseDown = false;
             let mouseX = 0, mouseY = 0;
             let lastMouseX = 0, lastMouseY = 0;
-            let hue = 0; // Color cycling
+            let hue = 0;
+            let currentR = 0, currentG = 0, currentB = 0; // Current base color
 
             // --- ALLOCATION ---
             function allocateBuffers() {
@@ -215,89 +225,100 @@
                 v_prev = new Float32Array(size);
                 dens = new Float32Array(size);
                 dens_prev = new Float32Array(size);
+
+                // Set internal canvas resolution to match grid size exactly
+                // CSS will handle stretching it to the screen
+                canvas.width = N;
+                canvas.height = N;
+                
+                // Create Image Buffer
+                imageData = ctx.createImageData(N, N);
+                data = imageData.data;
             }
 
-            // --- UTILS ---
-            // Convert 2D coordinates to 1D array index
             function IX(x, y) {
                 return x + (N + 2) * y;
             }
 
             // --- SOLVER FUNCTIONS ---
 
-            // Add sources (density or velocity) into the field
-            function add_source(x, s, dt) {
-                for (let i = 0; i < size; i++) {
-                    x[i] += dt * s[i];
-                }
-            }
-
-            // Set boundary conditions (walls)
             function set_bnd(b, x) {
-                // b: 1 for horizontal walls (reflect x-velocity), 2 for vertical (reflect y-velocity), 0 for density
-                
+                // b: 1=horizontal, 2=vertical, 0=density
                 // Edges
+                // Inline IX logic for slight perf gain in loops
+                const N2 = N + 2;
+                
                 for (let i = 1; i <= N; i++) {
-                    x[IX(0, i)]     = b === 1 ? -x[IX(1, i)] : x[IX(1, i)];
-                    x[IX(N + 1, i)] = b === 1 ? -x[IX(N, i)] : x[IX(N, i)];
-                    x[IX(i, 0)]     = b === 2 ? -x[IX(i, 1)] : x[IX(i, 1)];
-                    x[IX(i, N + 1)] = b === 2 ? -x[IX(i, N)] : x[IX(i, N)];
+                    x[i]             = b === 1 ? -x[1 + i*N2] : x[1 + i*N2];          // Left wall
+                    x[(N + 1) + i*N2] = b === 1 ? -x[N + i*N2] : x[N + i*N2];         // Right wall
+                    x[i * N2]         = b === 2 ? -x[i + N2] : x[i + N2];             // Top wall
+                    x[i + (N+1)*N2]   = b === 2 ? -x[i + N*N2] : x[i + N*N2];         // Bottom wall
                 }
 
                 // Corners
+                x[0]                 = 0.5 * (x[1] + x[N2]);
+                x[(N + 1) * N2]      = 0.5 * (x[1 + (N + 1) * N2] + x[N2 * N]); // Bottom Left? (indices need care)
+                // Simplify corner logic to basic IX calls for safety as they run only 4 times
                 x[IX(0, 0)]         = 0.5 * (x[IX(1, 0)] + x[IX(0, 1)]);
                 x[IX(0, N + 1)]     = 0.5 * (x[IX(1, N + 1)] + x[IX(0, N)]);
                 x[IX(N + 1, 0)]     = 0.5 * (x[IX(N, 0)] + x[IX(N + 1, 1)]);
                 x[IX(N + 1, N + 1)] = 0.5 * (x[IX(N, N + 1)] + x[IX(N + 1, N)]);
             }
 
-            // Linear Solver (Gauss-Seidel relaxation)
-            // Solves the diffusion equation and the Poisson equation for projection
+            // Heavily optimized linear solver
             function lin_solve(b, x, x0, a, c) {
                 const cRecip = 1.0 / c;
+                const N2 = N + 2; // Precompute row stride
+
                 for (let k = 0; k < iter; k++) {
                     for (let j = 1; j <= N; j++) {
-                        let currentRow = j * (N + 2);
+                        let currentIdx = j * N2 + 1; // Start of row j (at i=1)
+                        // Using a tight loop with incrementing index is faster than recalc IX() every time
                         for (let i = 1; i <= N; i++) {
-                            x[IX(i, j)] = (x0[IX(i, j)] + a * (
-                                x[IX(i + 1, j)] + 
-                                x[IX(i - 1, j)] + 
-                                x[IX(i, j + 1)] + 
-                                x[IX(i, j - 1)]
+                            // Neighbor indices: 
+                            // i+1 -> currentIdx + 1
+                            // i-1 -> currentIdx - 1
+                            // j+1 -> currentIdx + N2
+                            // j-1 -> currentIdx - N2
+                            
+                            x[currentIdx] = (x0[currentIdx] + a * (
+                                x[currentIdx + 1] + 
+                                x[currentIdx - 1] + 
+                                x[currentIdx + N2] + 
+                                x[currentIdx - N2]
                             )) * cRecip;
+                            
+                            currentIdx++;
                         }
                     }
                     set_bnd(b, x);
                 }
             }
 
-            // Diffuse: Fluids spread out over time due to viscosity
             function diffuse(b, x, x0, diff, dt) {
                 let a = dt * diff * (N * N);
                 lin_solve(b, x, x0, a, 1 + 4 * a);
             }
 
-            // Advect: Move density/velocity along the velocity field
-            // Uses back-tracing for stability
             function advect(b, d, d0, u, v, dt) {
                 let i0, j0, i1, j1;
                 let x, y, s0, t0, s1, t1;
                 let dt0 = dt * N;
+                const Nfloat = N; // float N
 
                 for (let j = 1; j <= N; j++) {
                     for (let i = 1; i <= N; i++) {
-                        x = i - dt0 * u[IX(i, j)];
-                        y = j - dt0 * v[IX(i, j)];
+                        const index = IX(i, j);
+                        x = i - dt0 * u[index];
+                        y = j - dt0 * v[index];
 
-                        // Clamp values
                         if (x < 0.5) x = 0.5;
-                        if (x > N + 0.5) x = N + 0.5;
-                        if (y < 0.5) y = 0.5;
-                        if (y > N + 0.5) y = N + 0.5;
+                        if (x > Nfloat + 0.5) x = Nfloat + 0.5;
+                        if (i0 = x | 0, i1 = i0 + 1, x < 0.5) i0=0, i1=0; // manual floor using bitwise OR
 
-                        i0 = Math.floor(x);
-                        i1 = i0 + 1;
-                        j0 = Math.floor(y);
+                        if (y < 0.5) y = 0.5;
+                        if (y > Nfloat + 0.5) y = Nfloat + 0.5;
+                        j0 = y | 0; // Fast floor
                         j1 = j0 + 1;
 
                         s1 = x - i0;
@@ -305,48 +326,51 @@
                         t1 = y - j0;
                         t0 = 1.0 - t1;
 
-                        d[IX(i, j)] =
-                            s0 * (t0 * d0[IX(i0, j0)] + t1 * d0[IX(i0, j1)]) +
-                            s1 * (t0 * d0[IX(i1, j0)] + t1 * d0[IX(i1, j1)]);
+                        const row0 = j0 * (N + 2);
+                        const row1 = j1 * (N + 2);
+
+                        d[index] =
+                            s0 * (t0 * d0[i0 + row0] + t1 * d0[i0 + row1]) +
+                            s1 * (t0 * d0[i1 + row0] + t1 * d0[i1 + row1]);
                     }
                 }
                 set_bnd(b, d);
             }
 
-            // Project: Enforce mass conservation (incompressibility)
-            // Subtracts the gradient of the pressure field to make the velocity field divergence-free
             function project(u, v, p, div) {
-                // Calculate Divergence
-                let h = 1.0 / N;
+                const N2 = N + 2;
+                const h = 1.0 / N;
+                
                 for (let j = 1; j <= N; j++) {
+                    let id = j * N2 + 1;
                     for (let i = 1; i <= N; i++) {
-                        div[IX(i, j)] = -0.5 * h * (
-                            u[IX(i + 1, j)] - u[IX(i - 1, j)] +
-                            v[IX(i, j + 1)] - v[IX(i, j - 1)]
+                        div[id] = -0.5 * h * (
+                            u[id + 1] - u[id - 1] +
+                            v[id + N2] - v[id - N2]
                         );
-                        p[IX(i, j)] = 0;
+                        p[id] = 0;
+                        id++;
                     }
                 }
                 set_bnd(0, div);
                 set_bnd(0, p);
 
-                // Solve Poisson equation for pressure
                 lin_solve(0, p, div, 1, 4);
 
-                // Subtract Gradient of pressure from velocity
                 for (let j = 1; j <= N; j++) {
+                    let id = j * N2 + 1;
                     for (let i = 1; i <= N; i++) {
-                        u[IX(i, j)] -= 0.5 * (p[IX(i + 1, j)] - p[IX(i - 1, j)]) / h;
-                        v[IX(i, j)] -= 0.5 * (p[IX(i, j + 1)] - p[IX(i, j - 1)]) / h;
+                        u[id] -= 0.5 * (p[id + 1] - p[id - 1]) / h;
+                        v[id] -= 0.5 * (p[id + N2] - p[id - N2]) / h;
+                        id++;
                     }
                 }
                 set_bnd(1, u);
                 set_bnd(2, v);
             }
 
-            // Main physics step
             function fluid_step() {
-                // 1. Velocity Step
+                // Physics steps remain conceptually same, just optimized internals
                 diffuse(1, u_prev, u, visc, dt);
                 diffuse(2, v_prev, v, visc, dt);
                 
@@ -357,75 +381,85 @@
                 
                 project(u, v, u_prev, v_prev);
 
-                // 2. Density Step
                 diffuse(0, dens_prev, dens, diff, dt);
                 advect(0, dens, dens_prev, u, v, dt);
 
-                // Fade out density over time (otherwise screen turns white eventually)
+                // Fade out
+                // Using a loop here is fast enough for typed arrays
+                // We could use .fill if we wanted to clear, but we are scaling
                 for(let i=0; i<size; i++) {
                     dens[i] *= 0.995; 
                 }
             }
 
 
-            // --- RENDERING ---
+            // --- RENDERING OPTIMIZED ---
             
-            // Create an offscreen buffer for pixel manipulation
-            let imgData;
-            
-            function initGraphics() {
-                width = canvas.width = window.innerWidth;
-                height = canvas.height = window.innerHeight;
-                
-                // We render to a small canvas matching grid size, then scale up via CSS/Canvas transform
-                // But to keep it sharp and fill screen, we'll draw rects (slower) or put pixels (faster)
-                // For this implementation, we will draw rects for clarity on the grid structure, 
-                // but optimize by scaling the context.
-                
-                // Actually, let's calculate cell size based on screen
-                // This ensures the grid fills the screen exactly
+            // Helper to convert HSL to RGB manually (much faster than CSS string parsing)
+            function updateBaseColor() {
+                // HSL to RGB conversion approximation
+                const h = hue % 360;
+                const s = 70 / 100;
+                const l = 50 / 100;
+
+                const c = (1 - Math.abs(2 * l - 1)) * s;
+                const x = c * (1 - Math.abs((h / 60) % 2 - 1));
+                const m = l - c / 2;
+
+                let r = 0, g = 0, b = 0;
+
+                if (0 <= h && h < 60) { r = c; g = x; b = 0; }
+                else if (60 <= h && h < 120) { r = x; g = c; b = 0; }
+                else if (120 <= h && h < 180) { r = 0; g = c; b = x; }
+                else if (180 <= h && h < 240) { r = 0; g = x; b = c; }
+                else if (240 <= h && h < 300) { r = x; g = 0; b = c; }
+                else if (300 <= h && h < 360) { r = c; g = 0; b = x; }
+
+                currentR = (r + m) * 255;
+                currentG = (g + m) * 255;
+                currentB = (b + m) * 255;
             }
 
             function draw() {
-                // Fill background
-                ctx.fillStyle = 'black';
-                ctx.fillRect(0, 0, width, height);
+                // Update global color
+                updateBaseColor();
+                hue += 0.5;
 
-                const cellWidth = Math.ceil(width / N);
-                const cellHeight = Math.ceil(height / N);
-
-                // Optimization: direct pixel manipulation is hard with dynamic scaling
-                // So we use fillRect. It's heavy for 200x200 but okay for modern PCs.
+                // Optimization: Write directly to the pixel buffer
+                // The buffer is N x N pixels.
+                // dens[] is size (N+2)*(N+2), so we must map correctly.
+                
+                let p = 0; // pixel index (0 to 4*N*N)
                 
                 for (let j = 1; j <= N; j++) {
+                    let fluidIdx = j * (N + 2) + 1; // Start of row in fluid array
+                    
                     for (let i = 1; i <= N; i++) {
-                        let d = dens[IX(i, j)];
-                        if (d > 0.01) {
-                            // Color mapping based on density
-                            // Higher density = brighter
-                            // We mix in the global hue for rainbow effect
+                        const d = dens[fluidIdx];
+                        
+                        // If density is very low, draw black (or background)
+                        if (d > 0.001) {
+                            // Simple lighting: density affects alpha/brightness
+                            // Clamp density to 0-1 range for math
+                            const alpha = d > 1 ? 1 : d;
                             
-                            // Clamp density for visualization
-                            const val = Math.min(255, d * 255);
-                            
-                            // HSL for nice colors
-                            // Hue cycles, Lightness based on density
-                            ctx.fillStyle = `hsla(${hue}, 70%, 50%, ${Math.min(1, d)})`;
-                            
-                            // Draw cell
-                            // We map grid coordinates (i,j) to screen coordinates
-                            const x = (i - 1) * cellWidth;
-                            const y = (j - 1) * cellHeight;
-                            
-                            // Using +1 on dimensions to avoid sub-pixel gaps
-                            ctx.fillRect(x, y, cellWidth, cellHeight);
+                            // Set pixel data (R, G, B, A)
+                            data[p]     = currentR;
+                            data[p + 1] = currentG;
+                            data[p + 2] = currentB;
+                            data[p + 3] = alpha * 255; // Alpha 0-255
+                        } else {
+                            data[p + 3] = 0; // Transparent (black bg shows through if cleared)
+                            // Or just set to black opaque:
+                            data[p] = 0; data[p+1] = 0; data[p+2] = 0; data[p+3] = 255; 
                         }
+
+                        p += 4;
+                        fluidIdx++;
                     }
                 }
-                
-                // Cycle hue
-                hue += 0.5;
-                if(hue > 360) hue = 0;
+
+                ctx.putImageData(imageData, 0, 0);
             }
 
 
@@ -434,12 +468,21 @@
             function handleInput() {
                 if (!isMouseDown) return;
 
-                // Calculate grid coordinates
-                const cellWidth = width / N;
-                const cellHeight = height / N;
+                // Map screen coordinates to simulation grid coordinates
+                // Canvas is scaled via CSS, so we need the bounding box
+                const rect = canvas.getBoundingClientRect();
+                
+                // Scale factor between screen pixels and canvas internal pixels
+                const scaleX = canvas.width / rect.width;
+                const scaleY = canvas.height / rect.height;
 
-                const i = Math.floor(mouseX / cellWidth) + 1;
-                const j = Math.floor(mouseY / cellHeight) + 1;
+                // Mouse Pos in Grid Coords
+                const gridX = (mouseX - rect.left) * scaleX;
+                const gridY = (mouseY - rect.top) * scaleY;
+                
+                // Floor to get index
+                const i = Math.floor(gridX);
+                const j = Math.floor(gridY);
 
                 // Add Density
                 if (i > 0 && i <= N && j > 0 && j <= N) {
@@ -448,8 +491,12 @@
                     
                     // Add Velocity based on mouse movement
                     const force = 5.0;
-                    const dx = (mouseX - lastMouseX) * force;
-                    const dy = (mouseY - lastMouseY) * force;
+                    // Calculate velocity in grid coords
+                    const prevGridX = (lastMouseX - rect.left) * scaleX;
+                    const prevGridY = (lastMouseY - rect.top) * scaleY;
+
+                    const dx = (gridX - prevGridX) * force;
+                    const dy = (gridY - prevGridY) * force;
 
                     u[IX(i, j)] += dx;
                     v[IX(i, j)] += dy;
@@ -474,7 +521,6 @@
 
             window.addEventListener('mouseup', () => isMouseDown = false);
             
-            // Touch support
             canvas.addEventListener('touchstart', e => {
                 e.preventDefault();
                 isMouseDown = true;
@@ -491,7 +537,9 @@
             
             window.addEventListener('touchend', () => isMouseDown = false);
 
-            window.addEventListener('resize', initGraphics);
+            // Resize isn't strictly needed for buffer size anymore since buffer is fixed N*N
+            // But we might want to re-grab rects on input if layout shifts.
+            // Using CSS scaling means we don't need to reallocate buffers on resize!
 
             // --- UI BINDING ---
             const uiVisc = document.getElementById('visc');
@@ -547,16 +595,17 @@
 
             function restart() {
                 allocateBuffers();
-                initGraphics();
-                // Clear background
-                ctx.fillStyle = 'black';
-                ctx.fillRect(0, 0, width, height);
+                // Clear buffers to black opaque
+                for(let i=0; i<data.length; i+=4) {
+                    data[i] = 0; data[i+1] = 0; data[i+2] = 0; data[i+3] = 255;
+                }
+                ctx.putImageData(imageData, 0, 0);
             }
 
             // Start
             restart();
             requestAnimationFrame(loop);
-        })(); // End IIFE
+        })(); 
     </script>
 </body>
 </html>
